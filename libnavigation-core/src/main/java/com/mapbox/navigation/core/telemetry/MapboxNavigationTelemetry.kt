@@ -14,9 +14,14 @@ import com.mapbox.navigation.base.metrics.MetricEvent
 import com.mapbox.navigation.base.metrics.MetricsReporter
 import com.mapbox.navigation.base.options.NavigationOptions
 import com.mapbox.navigation.base.trip.model.RouteProgressState
+import com.mapbox.navigation.base.trip.model.RouteProgressState.LOCATION_TRACKING
+import com.mapbox.navigation.base.trip.model.RouteProgressState.ROUTE_COMPLETE
 import com.mapbox.navigation.core.BuildConfig
 import com.mapbox.navigation.core.MapboxNavigation
-import com.mapbox.navigation.core.NavigationSession
+import com.mapbox.navigation.core.NavigationSession.State
+import com.mapbox.navigation.core.NavigationSession.State.ACTIVE_GUIDANCE
+import com.mapbox.navigation.core.NavigationSession.State.FREE_DRIVE
+import com.mapbox.navigation.core.NavigationSession.State.IDLE
 import com.mapbox.navigation.core.NavigationSessionStateObserver
 import com.mapbox.navigation.core.internal.accounts.MapboxNavigationAccounts
 import com.mapbox.navigation.core.telemetry.events.AppMetadata
@@ -39,7 +44,6 @@ import com.mapbox.navigation.utils.internal.Time
 import com.mapbox.navigation.utils.internal.ifChannelException
 import com.mapbox.navigation.utils.internal.ifNonNull
 import com.mapbox.navigation.utils.internal.monitorChannelWithException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -106,13 +110,11 @@ The class has two public methods, postUserFeedback() and initialize().
  */
 @SuppressLint("StaticFieldLeak")
 internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
-    internal const val LOCATION_BUFFER_MAX_SIZE = 20
     private const val ONE_SECOND = 1000
-    private const val MOCK_PROVIDER =
-        "com.mapbox.navigation.core.replay.ReplayLocationEngine"
-
-    internal const val TAG = "MAPBOX_TELEMETRY"
+    private const val MOCK_PROVIDER = "com.mapbox.navigation.core.replay.ReplayLocationEngine"
     private const val EVENT_VERSION = 7
+    internal const val TAG = "MAPBOX_TELEMETRY"
+
     private lateinit var context: Context // Must be context.getApplicationContext
     private lateinit var telemetryThreadControl: JobControl
     private val telemetryScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -134,71 +136,46 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
                 lifecycleMonitor = ApplicationLifecycleMonitor(app)
             }
         }
-
-    /**
-     * This class holds all mutable state of the Telemetry object
-     */
     private val dynamicValues = DynamicallyUpdatedRouteValues()
-
     private var locationEngineNameExternal: String = LocationEngine::javaClass.name
+    private val callbackDispatcher: TelemetryLocationAndProgressDispatcher =
+        TelemetryLocationAndProgressDispatcherImpl()
+    private var navigationSessionStarted = false
 
-    private lateinit var callbackDispatcher: TelemetryLocationAndProgressDispatcher
     private val navigationSessionObserver = object : NavigationSessionStateObserver {
-        override fun onNavigationSessionStateChanged(navigationSession: NavigationSession.State) {
+        override fun onNavigationSessionStateChanged(navigationSession: State) {
+            Log.d(TAG, "Navigation state is $navigationSession")
             when (navigationSession) {
-                NavigationSession.State.FREE_DRIVE -> {
-                    Log.d(TAG, "Navigation state is $navigationSession")
-                    switchToNotActiveGuidanceBehavior()
-                }
-                NavigationSession.State.ACTIVE_GUIDANCE -> {
-                    Log.d(TAG, "Navigation state is $navigationSession")
-                    sessionStart()
-                }
-                NavigationSession.State.IDLE -> {
-                    Log.d(TAG, "Navigation state is $navigationSession")
-                    switchToNotActiveGuidanceBehavior()
-                }
+                FREE_DRIVE -> switchToNotActiveGuidanceBehavior()
+                ACTIVE_GUIDANCE -> sessionStart()
+                IDLE -> switchToNotActiveGuidanceBehavior()
             }
             Log.d(TAG, "Current session state is: $navigationSession")
         }
     }
 
     private fun switchToNotActiveGuidanceBehavior() {
-        sessionEndPredicate()
-        sessionEndPredicate = {}
-        postUserEventDelegate = postUserEventBeforeInit
-        monitorSession?.cancel()
-        monitorSession = null
+        telemetryThreadControl.scope.launch {
+            if (navigationSessionStarted) {
+                sessionStop()
+            }
+            navigationSessionStarted = false
+            monitorSession?.cancel()
+            monitorSession = null
+        }
     }
 
-    private fun telemetryEventGate(event: MetricEvent) =
-        when (isTelemetryAvailable()) {
-            false -> {
-                Log.i(
-                    TAG,
-                    "Route not selected. Telemetry event not sent. Caused by: Navigation " +
-                        "Session started: ${dynamicValues.sessionStarted.get()} Route exists: " +
-                        "${dynamicValues.originalRoute.get() != null}"
-                )
-                false
-            }
-            true -> {
-                metricsReporter.addEvent(event)
-                true
-            }
-        }
-
-// **********  EVENT OBSERVERS ***************
-
-    private fun populateOriginalRouteConditionally() {
-        ifNonNull(weakMapboxNavigation.get()) { mapboxNavigation ->
-            val routes = mapboxNavigation.getRoutes()
-            if (routes.isNotEmpty()) {
-                Log.d(TAG, "Getting last route from MapboxNavigation")
-                callbackDispatcher.clearOriginalRoute()
-                callbackDispatcher.getOriginalRouteReadWrite()
-                    .set(RouteAvailable(routes[0], Date()))
-            }
+    private fun telemetryEventGate(event: MetricEvent) {
+        if (isTelemetryAvailable()) {
+            Log.d(TAG, "${event::class.java} event sent")
+            metricsReporter.addEvent(event)
+        } else {
+            Log.d(
+                TAG,
+                "${event::class.java} not sent. Caused by: " +
+                    "Navigation Session started: ${dynamicValues.sessionStarted.get()}. " +
+                    "Route exists: ${dynamicValues.originalRoute.get() != null}"
+            )
         }
     }
 
@@ -207,39 +184,21 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         ifNonNull(weakMapboxNavigation.get()?.getRoutes()) { routes ->
             isActiveGuidance = routes.isNotEmpty()
         }
-        when (isActiveGuidance) {
-            true -> {
-                telemetryThreadControl.scope.launch {
-                    callbackDispatcher.resetRouteProgressProcessor()
-                    postUserEventDelegate =
-                        postUserFeedbackEventAfterInit // Telemetry is initialized and the user selected a route. Allow user feedback events to be posted
-                    handleSessionStart()
-                    sessionEndPredicate = {
-                        telemetryScope.launch {
-                            sessionStop()
-                        }
-                    }
-                }
-            }
-            false -> {
-                // Do nothing
-                Log.d(TAG, "Only Active Guidance supported")
+        if (isActiveGuidance) {
+            telemetryThreadControl.scope.launch {
+                callbackDispatcher.resetRouteProgress()
+                navigationSessionStarted = true
+                handleSessionStart()
             }
         }
     }
 
     private suspend fun sessionStop() {
         Log.d(TAG, "sessionStop")
-        // The navigation session is over, disallow posting user feedback events
-        postUserEventDelegate = postUserEventBeforeInit
-        // Cancellation events will be sent after an arrival event.
-        when (dynamicValues.routeArrived.get()) {
-            true, false -> {
-                telemetryScope.launch {
-                    Log.d(TAG, "calling processCancellationAfterArrival()")
-                    processCancellation()
-                }.join()
-            }
+        if (dynamicValues.routeArrived.get()) {
+            Log.d(TAG, "calling processCancellationAfterArrival()")
+            handleSessionCanceled()
+            handleSessionStop()
         }
     }
 
@@ -257,30 +216,27 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
      */
     private fun handleOffRouteEvent() {
         telemetryThreadControl.scope.launch {
-            dynamicValues.timeOfRerouteEvent.set(Time.SystemImpl.millis())
-            dynamicValues.rerouteCount.addAndGet(1) // increment reroute count
-            val prevRoute = callbackDispatcher.getRouteProgress()
-            val newRoute = callbackDispatcher.getDirectionsRouteChannel()
-                .receive() // Suspend until we get a value
+            val routeProgress = callbackDispatcher.routeProgress
+            val newRoute = callbackDispatcher.routeChannel.receive()
 
-            dynamicValues.distanceRemaining.set(newRoute.route.distance()?.toLong() ?: -1)
-            dynamicValues.timeSinceLastReroute.set(
-                (Time.SystemImpl.millis() - dynamicValues.timeOfRerouteEvent.get()).toInt()
-            )
-            callbackDispatcher.addLocationEventDescriptor(
-                ItemAccumulationEventDescriptor(
-                    ArrayDeque(callbackDispatcher.getCopyOfCurrentLocationBuffer()),
-                    ArrayDeque()
-                ) { preEventBuffer, postEventBuffer ->
-                    // Populate the RerouteEvent
+            dynamicValues.run {
+                timeOfRerouteEvent.set(Time.SystemImpl.millis())
+                rerouteCount.addAndGet(1)
+                distanceRemaining.set(newRoute.distance()?.toLong() ?: -1)
+                timeSinceLastReroute.set(
+                    (Time.SystemImpl.millis() - timeOfRerouteEvent.get()).toInt()
+                )
+            }
+
+            callbackDispatcher.accumulatePostEventLocations { preEventBuffer, postEventBuffer ->
+                telemetryThreadControl.scope.launch {
                     val rerouteEvent = RerouteEvent(populateSessionState()).apply {
-                        newDistanceRemaining = newRoute.route.distance()?.toInt() ?: -1
-                        newDurationRemaining = newRoute.route.duration()?.toInt() ?: -1
-                        newRouteGeometry = obtainGeometry(newRoute.route)
+                        newDistanceRemaining = newRoute.distance()?.toInt() ?: -1
+                        newDurationRemaining = newRoute.duration()?.toInt() ?: -1
+                        newRouteGeometry = obtainGeometry(newRoute)
                     }
 
-                    // Populate and then send a NavigationRerouteEvent
-                    val metricsRouteProgress = MetricsRouteProgress(prevRoute.routeProgress)
+                    val metricsRouteProgress = MetricsRouteProgress(routeProgress)
                     val navigationRerouteEvent = NavigationRerouteEvent(
                         PhoneState(context),
                         rerouteEvent,
@@ -290,91 +246,13 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
                         locationsAfter = postEventBuffer.toTelemetryLocations().toTypedArray()
                         secondsSinceLastReroute =
                             dynamicValues.timeSinceLastReroute.get() / ONE_SECOND
-                        distanceRemaining = dynamicValues.distanceRemaining.get().toInt()
-                        distanceCompleted = dynamicValues.distanceCompleted.get().toInt()
-                        durationRemaining = dynamicValues.durationRemaining.get()
                     }
                     populateNavigationEvent(navigationRerouteEvent)
-                    val result = telemetryEventGate(
-                        navigationRerouteEvent
-                    )
-                    Log.d(TAG, "REROUTE event sent $result")
+                    telemetryEventGate(navigationRerouteEvent)
                 }
-            )
+            }
         }
     }
-
-    /**
-     * The lambda that is called if the SDK client did not initialize telemetry. If telemetry is not initialized,
-     * calls to post a user feedback event will fail silently
-     */
-    private val postUserEventBeforeInit: suspend (
-        String,
-        String,
-        String,
-        String?,
-        Array<String>?,
-        AppMetadata?
-    ) -> Unit =
-        { _, _, _, _, _, _ ->
-            Log.d(TAG, "Not in a navigation session, cannot send user feedback events")
-        }
-
-    /**
-     * The lambda that is called once telemetry is initialized.
-     */
-    private val postUserFeedbackEventAfterInit: suspend (
-        String,
-        String,
-        String,
-        String?,
-        Array<String>?,
-        AppMetadata?
-    ) -> Unit =
-        { feedbackType, description, feedbackSource, screenshot, feedbackSubType, appMetadata ->
-            postUserFeedbackHelper(
-                feedbackType,
-                description,
-                feedbackSource,
-                screenshot,
-                feedbackSubType,
-                appMetadata
-            )
-        }
-
-    /**
-     * The delegate lambda that dispatches either a pre or post initialization userFeedbackEvent
-     */
-    private var postUserEventDelegate = postUserEventBeforeInit
-
-    private val initializer: (
-        Context,
-        MapboxNavigation,
-        MetricsReporter,
-        String,
-        JobControl,
-        NavigationOptions,
-        String
-    ) -> Boolean =
-        { context, mapboxNavigation, metricsReporter, name, jobControl, options, userAgent ->
-            telemetryThreadControl = jobControl
-            weakMapboxNavigation = WeakReference(mapboxNavigation)
-            weakMapboxNavigation.get()?.registerNavigationSessionObserver(navigationSessionObserver)
-            registerForNotification(mapboxNavigation)
-            monitorOffRouteEvents()
-            populateOriginalRouteConditionally()
-            this.context = context
-            localUserAgent = userAgent
-            locationEngineNameExternal = name
-            navigationOptions = options
-            this.metricsReporter = metricsReporter
-            postTurnstileEvent()
-            monitorJobCancelation()
-            Log.i(TAG, "Valid initialization")
-            true
-        }
-
-    private var sessionEndPredicate = { }
 
     fun setApplicationInstance(app: Application) {
         appInstance = app
@@ -397,38 +275,35 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
             telemetryThreadControl.job.cancelChildren()
             telemetryThreadControl.job.cancel()
         }
-        initializer(
-            context,
-            mapboxNavigation,
-            metricsReporter,
-            locationEngineName,
-            jobControl,
-            options,
-            userAgent
-        )
+
+        telemetryThreadControl = jobControl
+        weakMapboxNavigation = WeakReference(mapboxNavigation)
+        weakMapboxNavigation.get()?.registerNavigationSessionObserver(navigationSessionObserver)
+        registerForNotification(mapboxNavigation)
+        monitorOffRouteEvents()
+        this.context = context
+        localUserAgent = userAgent
+        locationEngineNameExternal = locationEngineName
+        navigationOptions = options
+        this.metricsReporter = metricsReporter
+        postTurnstileEvent()
+        monitorJobCancellation()
+        Log.i(TAG, "Valid initialization")
     }
 
     private fun monitorOffRouteEvents() {
         telemetryThreadControl.scope.monitorChannelWithException(
-            callbackDispatcher.getOffRouteEventChannel(),
-            { offRoute ->
-                when (offRoute) {
-                    true -> {
-                        handleOffRouteEvent()
-                    }
-                    false -> {
-                    }
-                }
-            }
+            callbackDispatcher.offRouteChannel,
+            { offRoute -> if (offRoute) handleOffRouteEvent() }
         )
     }
 
-    private fun monitorJobCancelation() {
+    private fun monitorJobCancellation() {
         telemetryScope.launch {
             select {
                 telemetryThreadControl.job.onJoin {
                     Log.d(TAG, "master job canceled")
-                    callbackDispatcher.flushBuffers()
+                    callbackDispatcher.clearLocationEventBuffer()
                     MapboxMetricsReporter.disable() // Disable telemetry unconditionally
                 }
             }
@@ -447,54 +322,31 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         feedbackSubType: Array<String>?,
         appMetadata: AppMetadata?
     ) {
-        telemetryThreadControl.scope.launch {
-            postUserEventDelegate(
-                feedbackType,
-                description,
-                feedbackSource,
-                screenshot,
-                feedbackSubType,
-                appMetadata
-            )
-        }
-    }
-
-    /**
-     * Helper class that posts user feedback. The call is available only after initialization
-     */
-    private fun postUserFeedbackHelper(
-        @FeedbackEvent.Type feedbackType: String,
-        description: String,
-        @FeedbackEvent.Source feedbackSource: String,
-        screenshot: String?,
-        feedbackSubType: Array<String>?,
-        appMetadata: AppMetadata?
-    ) {
-        Log.d(TAG, "trying to post a user feedback event")
-        val lastProgress = callbackDispatcher.getRouteProgress()
-        callbackDispatcher.addLocationEventDescriptor(
-            ItemAccumulationEventDescriptor(
-                ArrayDeque(callbackDispatcher.getCopyOfCurrentLocationBuffer()),
-                ArrayDeque()
-            ) { preEventBuffer, postEventBuffer ->
-                val feedbackEvent = NavigationFeedbackEvent(
-                    PhoneState(context),
-                    MetricsRouteProgress(lastProgress.routeProgress)
-                ).apply {
-                    this.feedbackType = feedbackType
-                    this.source = feedbackSource
-                    this.description = description
-                    this.screenshot = screenshot
-                    this.locationsBefore = preEventBuffer.toTelemetryLocations().toTypedArray()
-                    this.locationsAfter = postEventBuffer.toTelemetryLocations().toTypedArray()
-                    this.feedbackSubType = feedbackSubType
-                    this.appMetadata = appMetadata
+        if (navigationSessionStarted) {
+            telemetryThreadControl.scope.launch {
+                Log.d(TAG, "trying to post a user feedback event")
+                val lastProgress = callbackDispatcher.routeProgress
+                callbackDispatcher.accumulatePostEventLocations { preEventBuffer, postEventBuffer ->
+                    val feedbackEvent = NavigationFeedbackEvent(
+                        PhoneState(context),
+                        MetricsRouteProgress(lastProgress)
+                    ).apply {
+                        this.feedbackType = feedbackType
+                        this.source = feedbackSource
+                        this.description = description
+                        this.screenshot = screenshot
+                        this.locationsBefore = preEventBuffer.toTelemetryLocations().toTypedArray()
+                        this.locationsAfter = postEventBuffer.toTelemetryLocations().toTypedArray()
+                        this.feedbackSubType = feedbackSubType
+                        this.appMetadata = appMetadata
+                    }
+                    telemetryThreadControl.scope.launch {
+                        populateNavigationEvent(feedbackEvent)
+                        telemetryEventGate(feedbackEvent)
+                    }
                 }
-                populateNavigationEvent(feedbackEvent)
-                val eventPosted = telemetryEventGate(feedbackEvent)
-                Log.i(TAG, "Posting a user feedback event $eventPosted")
             }
-        )
+        }
     }
 
     private fun ArrayDeque<Location>.toTelemetryLocations(): List<TelemetryLocation> {
@@ -524,18 +376,14 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
     /**
      * This method posts a cancel event in response to onSessionEnd
      */
-    private suspend fun handleSessionCanceled(): CompletableDeferred<Boolean> {
-        val retVal = CompletableDeferred<Boolean>()
+    private suspend fun handleSessionCanceled() {
         val cancelEvent = NavigationCancelEvent(PhoneState(context))
         ifNonNull(dynamicValues.sessionArrivalTime.get()) {
             cancelEvent.arrivalTimestamp = TelemetryUtils.generateCreateDateFormatted(it)
         }
         populateNavigationEvent(cancelEvent)
-        val result = telemetryEventGate(cancelEvent)
-        Log.d(TAG, "CANCEL event sent $result")
-        callbackDispatcher.cancelCollectionAndPostFinalEvents().join()
-        retVal.complete(true)
-        return retVal
+        telemetryEventGate(cancelEvent)
+        callbackDispatcher.clearLocationEventBuffer()
     }
 
     /**
@@ -552,11 +400,9 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
      */
     private fun handleSessionStart() {
         telemetryThreadControl.scope.launch {
-            Log.d(TAG, "Waiting in handleSessionStart")
-            dynamicValues.originalRoute.set(callbackDispatcher.getOriginalRouteAsync().await())
-            dynamicValues.originalRoute.get()?.let { directionsRoute ->
-                Log.d(TAG, "The wait is over")
-                sessionStartHelper(directionsRoute)
+            callbackDispatcher.originalRoute.await().let {
+                dynamicValues.originalRoute.set(it)
+                sessionStartHelper(it)
             }
         }
     }
@@ -571,11 +417,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         dynamicValues.sdkId = generateSdkIdentifier()
         val appUserTurnstileEvent =
             AppUserTurnstile(sdkId, BuildConfig.MAPBOX_NAVIGATION_VERSION_NAME).also {
-                it.setSkuId(
-                    MapboxNavigationAccounts.getInstance(
-                        context
-                    ).obtainSkuId()
-                )
+                it.setSkuId(MapboxNavigationAccounts.getInstance(context).obtainSkuId())
             }
         val event = NavigationAppUserTurnstileEvent(appUserTurnstileEvent)
         metricsReporter.addEvent(event)
@@ -585,38 +427,34 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
      * This method starts a session. The start of a session does not result in a telemetry event being sent to the servers.
      */
     private fun sessionStartHelper(directionsRoute: DirectionsRoute) {
-        dynamicValues.sessionId = TelemetryUtils.obtainUniversalUniqueIdentifier()
-        dynamicValues.sessionStartTime = Date()
-        dynamicValues.sessionStarted.set(true)
+        dynamicValues.run {
+            sessionId = TelemetryUtils.obtainUniversalUniqueIdentifier()
+            sessionStartTime = Date()
+            sessionStarted.set(true)
+        }
+
         monitorSession = telemetryThreadControl.scope.launch {
-            val result = telemetryEventGate(
-                telemetryDeparture(
-                    directionsRoute,
-                    callbackDispatcher.getFirstLocationAsync().await()
-                )
+            val event = telemetryDeparture(
+                directionsRoute,
+                callbackDispatcher.firstLocation.await()
             )
-            Log.d(TAG, "DEPARTURE event sent $result")
+            telemetryEventGate(event)
             monitorSession()
         }
     }
 
-    private suspend fun processCancellation() {
-        Log.d(TAG, "Session was canceled")
-        handleSessionCanceled().await()
-        handleSessionStop()
-    }
-
     private suspend fun processArrival() {
         Log.d(TAG, "you have arrived")
-        dynamicValues.tripIdentifier.set(TelemetryUtils.obtainUniversalUniqueIdentifier())
-        dynamicValues.sessionArrivalTime.set(Date())
+        dynamicValues.run {
+            tripIdentifier.set(TelemetryUtils.obtainUniversalUniqueIdentifier())
+            sessionArrivalTime.set(Date())
+            routeArrived.set(true)
+        }
+
         val arriveEvent = NavigationArriveEvent(PhoneState(context))
-        dynamicValues.routeArrived.set(true)
         populateNavigationEvent(arriveEvent)
-        val result = telemetryEventGate(arriveEvent)
-        Log.d(TAG, "ARRIVAL event sent $result")
-        callbackDispatcher.cancelCollectionAndPostFinalEvents().join()
-        populateOriginalRouteConditionally()
+        telemetryEventGate(arriveEvent)
+        callbackDispatcher.clearLocationEventBuffer()
     }
 
     /**
@@ -628,57 +466,38 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         var trackingEvent = 0
         while (coroutineContext.isActive && continueRunning) {
             try {
-                val routeData = callbackDispatcher.getRouteProgressChannel().receive()
-                dynamicValues.distanceCompleted.set(
-                    dynamicValues.distanceCompleted.get() +
-                        routeData.routeProgress.distanceTraveled
-                )
-                dynamicValues.distanceRemaining.set(
-                    routeData.routeProgress.distanceRemaining.toLong()
-                )
-                dynamicValues.durationRemaining.set(
-                    routeData.routeProgress.durationRemaining.toInt()
-                )
-                when (routeData.routeProgress.currentState) {
-                    RouteProgressState.ROUTE_COMPLETE -> {
-                        when (dynamicValues.sessionStarted.get()) {
-                            true -> {
+                callbackDispatcher.routeProgressChannel.receive().let { progress ->
+                    dynamicValues.run {
+                        distanceCompleted.set(distanceCompleted.get() + progress.distanceTraveled)
+                        distanceRemaining.set(progress.distanceRemaining.toLong())
+                        durationRemaining.set(progress.durationRemaining.toInt())
+                    }
+
+                    when (progress.currentState) {
+                        ROUTE_COMPLETE -> {
+                            if (dynamicValues.sessionStarted.get()) {
                                 processArrival()
                                 continueRunning = false
-                            }
-                            false -> {
-                                // Do nothing.
+                            } else {
                                 Log.d(TAG, "route arrival received before a session start")
                             }
                         }
-                    } // END
-                    RouteProgressState.LOCATION_TRACKING -> {
-                        dynamicValues.timeRemaining.set(
-                            callbackDispatcher
-                                .getRouteProgress()
-                                .routeProgress
-                                .durationRemaining
-                                .toInt()
-                        )
-                        dynamicValues.distanceRemaining.set(
-                            callbackDispatcher
-                                .getRouteProgress()
-                                .routeProgress
-                                .distanceRemaining
-                                .toLong()
-                        )
-                        when (trackingEvent > 20) {
-                            true -> {
-                                Log.i(TAG, "LOCATION_TRACKING received $trackingEvent")
-                                trackingEvent = 0
+                        LOCATION_TRACKING -> {
+                            callbackDispatcher.routeProgress?.let {
+                                dynamicValues.timeRemaining.set(it.durationRemaining.toInt())
+                                dynamicValues.distanceRemaining.set(it.distanceRemaining.toLong())
                             }
-                            false -> {
+
+                            if (trackingEvent > 20) {
+                                Log.d(TAG, "LOCATION_TRACKING received $trackingEvent")
+                                trackingEvent = 0
+                            } else {
                                 trackingEvent++
                             }
                         }
-                    }
-                    else -> {
-                        // Do nothing
+                        else -> {
+                            // Do nothing
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -690,7 +509,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         }
     }
 
-    private fun telemetryDeparture(
+    private suspend fun telemetryDeparture(
         directionsRoute: DirectionsRoute,
         startingLocation: Location
     ): MetricEvent {
@@ -700,120 +519,125 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
     }
 
     private fun registerForNotification(mapboxNavigation: MapboxNavigation) {
-        callbackDispatcher =
-            TelemetryLocationAndProgressDispatcher(telemetryThreadControl.scope) // The class responds to most notification events
-        mapboxNavigation.registerRouteProgressObserver(callbackDispatcher)
-        mapboxNavigation.registerLocationObserver(callbackDispatcher)
-        mapboxNavigation.registerRoutesObserver(callbackDispatcher)
-        mapboxNavigation.registerOffRouteObserver(callbackDispatcher)
+        mapboxNavigation.run {
+            registerRouteProgressObserver(callbackDispatcher)
+            registerLocationObserver(callbackDispatcher)
+            registerRoutesObserver(callbackDispatcher)
+            registerOffRouteObserver(callbackDispatcher)
+        }
     }
 
     override fun unregisterListeners(mapboxNavigation: MapboxNavigation) {
-        mapboxNavigation.unregisterRouteProgressObserver(callbackDispatcher)
-        mapboxNavigation.unregisterLocationObserver(callbackDispatcher)
-        mapboxNavigation.unregisterRoutesObserver(callbackDispatcher)
-        mapboxNavigation.unregisterOffRouteObserver(callbackDispatcher)
-        mapboxNavigation.unregisterNavigationSessionObserver(navigationSessionObserver)
+        mapboxNavigation.run {
+            unregisterRouteProgressObserver(callbackDispatcher)
+            unregisterLocationObserver(callbackDispatcher)
+            unregisterRoutesObserver(callbackDispatcher)
+            unregisterOffRouteObserver(callbackDispatcher)
+            unregisterNavigationSessionObserver(navigationSessionObserver)
+        }
         Log.d(TAG, "resetting Telemetry initialization")
         weakMapboxNavigation.clear()
     }
 
-    private fun populateSessionState(newLocation: Location? = null): SessionState {
-        val timeSinceReroute: Int = if (dynamicValues.timeSinceLastReroute.get() == 0) {
-            -1
-        } else
-            dynamicValues.timeSinceLastReroute.get()
+    private suspend fun populateSessionState(newLocation: Location? = null): SessionState {
 
         return SessionState().apply {
-            secondsSinceLastReroute = timeSinceReroute
-            eventLocation =
-                newLocation ?: callbackDispatcher.getLastLocation() ?: Location("unknown")
+            dynamicValues.let {
+                sessionIdentifier = it.sessionId
+                tripIdentifier = it.tripIdentifier.get()
+                rerouteCount = it.rerouteCount.get()
+                startTimestamp = it.sessionStartTime
+                arrivalTimestamp = it.sessionArrivalTime.get()
+                secondsSinceLastReroute = if (it.timeSinceLastReroute.get() == 0) {
+                    -1
+                } else
+                    it.timeSinceLastReroute.get()
+            }
 
-            eventDate = Date()
-            eventRouteDistanceCompleted =
-                callbackDispatcher.getRouteProgress().routeProgress.distanceTraveled.toDouble()
-            originalDirectionRoute = callbackDispatcher.getOriginalRouteReadOnly()?.route
-            currentDirectionRoute = callbackDispatcher.getRouteProgress().routeProgress.route
-            sessionIdentifier = dynamicValues.sessionId
-            tripIdentifier = dynamicValues.tripIdentifier.get()
-            originalRequestIdentifier =
-                callbackDispatcher.getOriginalRouteReadOnly()?.route?.routeOptions()?.requestUuid()
-            requestIdentifier =
-                callbackDispatcher.getRouteProgress().routeProgress.route.routeOptions()
-                    ?.requestUuid()
+            callbackDispatcher.let {
+                eventLocation = newLocation ?: it.lastLocation ?: Location("unknown")
+                val originalRoute = it.originalRoute.await()
+                originalDirectionRoute = originalRoute
+                originalRequestIdentifier = originalRoute.routeOptions()?.requestUuid()
+
+                val routeProgress = it.routeProgress
+                eventRouteDistanceCompleted = routeProgress?.distanceTraveled?.toDouble() ?: 0.0
+                currentDirectionRoute = routeProgress?.route
+                requestIdentifier = routeProgress?.route?.routeOptions()?.requestUuid()
+            }
+
             mockLocation = locationEngineName == MOCK_PROVIDER
-            rerouteCount = dynamicValues.rerouteCount.get()
-            startTimestamp = dynamicValues.sessionStartTime
-            arrivalTimestamp = dynamicValues.sessionArrivalTime.get()
+            eventDate = Date()
             locationEngineName = locationEngineNameExternal
             percentInForeground = lifecycleMonitor?.obtainForegroundPercentage() ?: 100
             percentInPortrait = lifecycleMonitor?.obtainPortraitPercentage() ?: 100
         }
     }
 
-    private fun populateNavigationEvent(
+    private suspend fun populateNavigationEvent(
         navigationEvent: NavigationEvent,
         route: DirectionsRoute? = null,
         newLocation: Location? = null
     ) {
-        val directionsRoute = route ?: callbackDispatcher.getRouteProgress().routeProgress.route
-        val location = newLocation ?: callbackDispatcher.getLastLocation()
-        navigationEvent.startTimestamp =
-            TelemetryUtils.generateCreateDateFormatted(dynamicValues.sessionStartTime)
-        navigationEvent.sdkIdentifier = generateSdkIdentifier()
-        navigationEvent.sessionIdentifier = dynamicValues.sessionId
-        navigationEvent.geometry =
-            callbackDispatcher.getRouteProgress().routeProgress.route.geometry()
-        navigationEvent.profile =
-            callbackDispatcher.getRouteProgress().routeProgress.route.routeOptions()?.profile()
-        navigationEvent.originalRequestIdentifier =
-            callbackDispatcher.getOriginalRouteReadOnly()?.route?.routeOptions()?.requestUuid()
-        navigationEvent.requestIdentifier =
-            callbackDispatcher.getRouteProgress().routeProgress.route.routeOptions()?.requestUuid()
-        navigationEvent.originalGeometry =
-            callbackDispatcher.getOriginalRouteReadOnly()?.route?.geometry()
-        navigationEvent.locationEngine = locationEngineNameExternal
-        navigationEvent.tripIdentifier = TelemetryUtils.obtainUniversalUniqueIdentifier()
-        navigationEvent.lat = location?.latitude ?: 0.0
-        navigationEvent.lng = location?.longitude ?: 0.0
-        navigationEvent.simulation = locationEngineNameExternal == MOCK_PROVIDER
-        navigationEvent.absoluteDistanceToDestination = obtainAbsoluteDistance(
-            callbackDispatcher.getLastLocation(),
-            obtainRouteDestination(directionsRoute)
-        )
-        navigationEvent.percentTimeInPortrait = lifecycleMonitor?.obtainPortraitPercentage() ?: 100
-        navigationEvent.percentTimeInForeground =
-            lifecycleMonitor?.obtainForegroundPercentage() ?: 100
-        navigationEvent.distanceCompleted = dynamicValues.distanceCompleted.get().toInt()
-        navigationEvent.distanceRemaining = dynamicValues.distanceRemaining.get().toInt()
-        navigationEvent.durationRemaining = dynamicValues.durationRemaining.get()
-        navigationEvent.eventVersion = EVENT_VERSION
-        navigationEvent.estimatedDistance = directionsRoute.distance()?.toInt() ?: 0
-        navigationEvent.estimatedDuration = directionsRoute.duration()?.toInt() ?: 0
-        navigationEvent.rerouteCount = dynamicValues.rerouteCount.get()
-        navigationEvent.originalEstimatedDistance =
-            callbackDispatcher.getOriginalRouteReadOnly()?.route?.distance()?.toInt() ?: 0
-        navigationEvent.originalEstimatedDuration =
-            callbackDispatcher.getOriginalRouteReadOnly()?.route?.duration()?.toInt() ?: 0
-        navigationEvent.stepCount =
-            obtainStepCount(callbackDispatcher.getRouteProgress().routeProgress.route)
-        navigationEvent.originalStepCount =
-            obtainStepCount(callbackDispatcher.getOriginalRouteReadOnly()?.route)
-        navigationEvent.legIndex =
-            callbackDispatcher.getRouteProgress().routeProgress.route.routeIndex()?.toInt() ?: 0
-        navigationEvent.legCount =
-            callbackDispatcher.getRouteProgress().routeProgress.route.legs()?.size ?: 0
-        navigationEvent.stepIndex = callbackDispatcher
-            .getRouteProgress()
-            .routeProgress
-            .currentLegProgress
-            ?.currentStepProgress
-            ?.stepIndex
-            ?: 0
+        val directionsRoute = route ?: callbackDispatcher.routeProgress?.route
+        val location = newLocation ?: callbackDispatcher.lastLocation
 
-        // TODO:OZ voiceIndex is not available in SDK 1.0 and was not set in the legacy telemetry        navigationEvent.voiceIndex
-        // TODO:OZ bannerIndex is not available in SDK 1.0 and was not set in the legacy telemetry        navigationEvent.bannerIndex
-        navigationEvent.totalStepCount = obtainStepCount(directionsRoute)
+        navigationEvent.apply {
+            sdkIdentifier = generateSdkIdentifier()
+
+            callbackDispatcher.routeProgress?.let { routeProgress ->
+                stepIndex = routeProgress.currentLegProgress?.currentStepProgress?.stepIndex ?: 0
+
+                routeProgress.route.let {
+                    geometry = it.geometry()
+                    profile = it.routeOptions()?.profile()
+                    requestIdentifier = it.routeOptions()?.requestUuid()
+                    stepCount = obtainStepCount(it)
+                    legIndex = it.routeIndex()?.toInt() ?: 0
+                    legCount = it.legs()?.size ?: 0
+                }
+            }
+
+            callbackDispatcher.originalRoute.await().let {
+                originalStepCount = obtainStepCount(it)
+                originalEstimatedDistance = it.distance()?.toInt() ?: 0
+                originalEstimatedDuration = it.duration()?.toInt() ?: 0
+                originalRequestIdentifier = it.routeOptions()?.requestUuid()
+                originalGeometry = it.geometry()
+            }
+
+            locationEngine = locationEngineNameExternal
+            tripIdentifier = TelemetryUtils.obtainUniversalUniqueIdentifier()
+            lat = location?.latitude ?: 0.0
+            lng = location?.longitude ?: 0.0
+            simulation = locationEngineNameExternal == MOCK_PROVIDER
+            percentTimeInPortrait = lifecycleMonitor?.obtainPortraitPercentage() ?: 100
+            percentTimeInForeground = lifecycleMonitor?.obtainForegroundPercentage() ?: 100
+
+            dynamicValues.let {
+                startTimestamp = TelemetryUtils.generateCreateDateFormatted(it.sessionStartTime)
+                distanceCompleted = it.distanceCompleted.get().toInt()
+                distanceRemaining = it.distanceRemaining.get().toInt()
+                durationRemaining = it.durationRemaining.get()
+                rerouteCount = it.rerouteCount.get()
+                sessionIdentifier = it.sessionId
+            }
+
+            eventVersion = EVENT_VERSION
+
+            directionsRoute?.let {
+                absoluteDistanceToDestination = obtainAbsoluteDistance(
+                    callbackDispatcher.lastLocation,
+                    obtainRouteDestination(it)
+                )
+                estimatedDistance = it.distance()?.toInt() ?: 0
+                estimatedDuration = it.duration()?.toInt() ?: 0
+
+                // TODO:OZ voiceIndex is not available in SDK 1.0 and was not set in the legacy telemetry        navigationEvent.voiceIndex
+                // TODO:OZ bannerIndex is not available in SDK 1.0 and was not set in the legacy telemetry        navigationEvent.bannerIndex
+                totalStepCount = obtainStepCount(it)
+            }
+        }
     }
 
     private fun generateSdkIdentifier() =
