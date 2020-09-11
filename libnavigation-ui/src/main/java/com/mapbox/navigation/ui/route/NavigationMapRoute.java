@@ -1,6 +1,7 @@
 package com.mapbox.navigation.ui.route;
 
 import android.content.Context;
+import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -51,7 +52,7 @@ public class NavigationMapRoute implements LifecycleObserver {
 
   @StyleRes
   private final int styleRes;
-  @Nullable
+  private final String TAG = "NavigationMapRoute";
   private final String belowLayer;
   @NonNull
   private final MapboxMap mapboxMap;
@@ -114,7 +115,7 @@ public class NavigationMapRoute implements LifecycleObserver {
             routeLineInitializedCallback
     );
     this.routeArrow = new MapRouteArrow(mapView, mapboxMap, styleRes, LAYER_ABOVE_UPCOMING_MANEUVER_ARROW);
-    this.mapRouteClickListener = new MapRouteClickListener(this.routeLine);
+    this.mapRouteClickListener = new MapRouteClickListener(this.routeLine, mapboxMap);
     this.mapRouteProgressChangeListener = buildMapRouteProgressChangeListener();
     this.routeLineInitializedCallback = routeLineInitializedCallback;
     this.lifecycleOwner = lifecycleOwner;
@@ -194,8 +195,10 @@ public class NavigationMapRoute implements LifecycleObserver {
             routeLine.retrieveDirectionsRoutes(),
             directionsRoutes
     )) {
+      Log.d(TAG, "CompareUtils.areEqualContentsIgnoreOrder");
       routeLine.updatePrimaryRouteIndex(directionsRoutes.get(0));
     } else {
+      Log.d(TAG, "!CompareUtils.areEqualContentsIgnoreOrder && routeLine.draw(directionsRoutes);");
       routeLine.draw(directionsRoutes);
     }
   }
@@ -286,7 +289,7 @@ public class NavigationMapRoute implements LifecycleObserver {
   }
 
   /**
-   * Should be called if {@link #addProgressChangeListener(MapboxNavigation, boolean)} was
+   * Should be called if {@link #addProgressChangeListener(MapboxNavigation)} was
    * called to prevent leaking.
    *
    * @param navigation to remove the progress change listener
@@ -315,7 +318,7 @@ public class NavigationMapRoute implements LifecycleObserver {
    * <p>
    * {@link NavigationMapRoute} automatically listens to
    * {@link RouteProgressObserver#onRouteProgressChanged(RouteProgress)} when a progress observer
-   * is subscribed with {@link #addProgressChangeListener(MapboxNavigation, boolean)}
+   * is subscribed with {@link #addProgressChangeListener(MapboxNavigation)}
    * and invoking this method in that scenario will lead to competing updates.
    * @param routeProgress current progress
    */
@@ -449,7 +452,7 @@ public class NavigationMapRoute implements LifecycleObserver {
         routeLineInitializedCallback
     );
     mapboxMap.removeOnMapClickListener(mapRouteClickListener);
-    mapRouteClickListener = new MapRouteClickListener(routeLine);
+    mapRouteClickListener = new MapRouteClickListener(routeLine, mapboxMap);
     mapboxMap.addOnMapClickListener(mapRouteClickListener);
   }
 

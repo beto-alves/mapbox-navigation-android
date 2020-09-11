@@ -1,13 +1,17 @@
 package com.mapbox.navigation.examples.core
 
 import android.annotation.SuppressLint
+import android.graphics.Color
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.os.Looper
+import android.util.Log
+import android.view.Gravity
 import android.view.View
 import android.view.View.GONE
 import android.view.View.VISIBLE
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.preference.PreferenceManager
@@ -35,8 +39,8 @@ import com.mapbox.mapboxsdk.maps.OnMapReadyCallback
 import com.mapbox.mapboxsdk.maps.Style
 import com.mapbox.mapboxsdk.plugins.annotation.SymbolManager
 import com.mapbox.mapboxsdk.plugins.annotation.SymbolOptions
-import com.mapbox.navigation.base.internal.extensions.applyDefaultParams
 import com.mapbox.navigation.base.internal.extensions.coordinates
+import com.mapbox.navigation.base.internal.route.RouteUrl
 import com.mapbox.navigation.base.options.NavigationOptions
 import com.mapbox.navigation.base.trip.model.RouteProgress
 import com.mapbox.navigation.core.MapboxNavigation
@@ -62,8 +66,13 @@ import com.mapbox.navigation.ui.map.NavigationMapboxMap
 import com.mapbox.navigation.ui.voice.NavigationSpeechPlayer
 import com.mapbox.navigation.ui.voice.SpeechPlayerProvider
 import com.mapbox.navigation.ui.voice.VoiceInstructionLoader
-import kotlinx.android.synthetic.main.bottom_sheet_faster_route.*
-import kotlinx.android.synthetic.main.content_simple_mapbox_navigation.*
+import kotlinx.android.synthetic.main.bottom_sheet_faster_route.acceptLayout
+import kotlinx.android.synthetic.main.bottom_sheet_faster_route.bottomSheetFasterRoute
+import kotlinx.android.synthetic.main.bottom_sheet_faster_route.dismissLayout
+import kotlinx.android.synthetic.main.bottom_sheet_faster_route.fasterRouteAcceptProgress
+import kotlinx.android.synthetic.main.content_simple_mapbox_navigation.container
+import kotlinx.android.synthetic.main.content_simple_mapbox_navigation.mapView
+import kotlinx.android.synthetic.main.content_simple_mapbox_navigation.startNavigation
 import kotlinx.coroutines.channels.Channel
 import okhttp3.Cache
 import timber.log.Timber
@@ -155,17 +164,28 @@ class SimpleMapboxNavigationKt :
         this.mapboxMap = mapboxMap
         mapboxMap.moveCamera(CameraUpdateFactory.zoomTo(15.0))
 
+      /*  mapboxMap.addOnMapClickListener {
+            val crosshair = View(this)
+            crosshair.layoutParams = FrameLayout.LayoutParams(300, 300, Gravity.CENTER)
+            crosshair.setBackgroundColor(Color.RED)
+            mapView.addView(crosshair)
+            true
+        }*/
         mapboxMap.addOnMapLongClickListener { click ->
             locationComponent?.lastKnownLocation?.let { location ->
-                mapboxNavigation.requestRoutes(
-                    RouteOptions.builder().applyDefaultParams()
-                        .accessToken(Utils.getMapboxAccessToken(applicationContext))
-                        .coordinates(location.toPoint(), null, click.toPoint())
-                        .alternatives(true)
-                        .profile(DirectionsCriteria.PROFILE_DRIVING_TRAFFIC)
-                        .build(),
-                    routesReqCallback
-                )
+
+                val routeOptions = RouteOptions.builder()
+                    .baseUrl(RouteUrl.BASE_URL)
+                    .user(RouteUrl.PROFILE_DEFAULT_USER)
+                    .geometries(RouteUrl.GEOMETRY_POLYLINE6)
+                    .requestUuid("")
+                    .accessToken(Utils.getMapboxAccessToken(applicationContext))
+                    .coordinates(location.toPoint(), null, click.toPoint())
+                    .alternatives(true)
+                    .profile(DirectionsCriteria.PROFILE_DRIVING)
+                    .build()
+
+                mapboxNavigation.requestRoutes(routeOptions, routesReqCallback)
 
                 symbolManager?.deleteAll()
                 symbolManager?.create(
@@ -196,9 +216,11 @@ class SimpleMapboxNavigationKt :
                 this,
                 true
             )
+            navigationMapboxMap.showAlternativeRoutes(true)
             navigationMapboxMap.setCamera(DynamicCamera(mapboxMap))
             navigationMapboxMap.addProgressChangeListener(mapboxNavigation)
             navigationMapboxMap.setOnRouteSelectionChangeListener { route ->
+                Log.d("SimpleNavActivity", "onMapReady: route.duration() = ${route.duration()}")
                 mapboxNavigation.setRoutes(
                     mapboxNavigation.getRoutes().toMutableList().apply {
                         remove(route)

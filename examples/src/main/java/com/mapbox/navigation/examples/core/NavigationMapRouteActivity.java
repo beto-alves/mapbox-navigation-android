@@ -122,6 +122,7 @@ public class NavigationMapRouteActivity extends AppCompatActivity implements OnM
               .withMapboxNavigation(mapboxNavigation)
               .build();
 
+      navigationMapRoute.showAlternativeRoutes(true);
       mapboxNavigation.getNavigationOptions().getLocationEngine().getLastLocation(locationEngineCallback);
       mapboxMap.addOnMapLongClickListener(this);
 
