@@ -50,7 +50,7 @@ internal class TelemetryLocationAndProgressDispatcherImpl :
     }
 
     private fun flushLocationEventBuffer() {
-        Log.d(TAG, "flushing buffers before ${lastLocations.size}")
+        Log.d(TAG, "flushing eventsLocationsBuffer")
         eventsLocationsBuffer.forEach { it.onBufferFull() }
     }
 

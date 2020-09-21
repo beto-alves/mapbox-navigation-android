@@ -331,7 +331,7 @@ class MapboxNavigation(
     fun onDestroy() {
         logger.d(
             Tag(MapboxNavigationTelemetry.TAG),
-            Message("onDestroy")
+            Message("MapboxNavigation onDestroy")
         )
         MapboxNavigationTelemetry.unregisterListeners(this@MapboxNavigation)
         directionsSession.shutdown()
