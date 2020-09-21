@@ -204,10 +204,6 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         return dynamicValues.originalRoute.get() != null && dynamicValues.sessionStarted.get()
     }
 
-    /**
-     * This method generates an off-route telemetry event. Part of the code is suspendable
-     * because it waits for a new route to be offered by the SDK in response to a reroute
-     */
     private fun handleOffRouteEvent() {
         telemetryThreadControl.scope.launch {
             val routeProgress = callbackDispatcher.routeProgress
@@ -303,10 +299,6 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         }
     }
 
-    /**
-     * This method sends a user feedback event to the back-end servers. The method will suspend because the helper method it calls is itself suspendable
-     * The method may suspend until it collects 40 location events. The worst case scenario is a 40 location suspension, 20 is best case
-     */
     override fun postUserFeedback(
         @FeedbackEvent.Type feedbackType: String,
         description: String,
@@ -366,9 +358,6 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         return feedbackLocations
     }
 
-    /**
-     * This method posts a cancel event in response to onSessionEnd
-     */
     private suspend fun handleSessionCanceled() {
         val cancelEvent = NavigationCancelEvent(PhoneState(context))
         ifNonNull(dynamicValues.sessionArrivalTime.get()) {
@@ -379,20 +368,12 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         callbackDispatcher.clearLocationEventBuffer()
     }
 
-    /**
-     * This method clears the state data for the Telemetry object in response to onSessionEnd
-     */
     private fun handleSessionStop() {
         dynamicValues.reset()
         callbackDispatcher.clearOriginalRoute()
     }
 
-    /**
-     * This method is used by a lambda. Since the Telemetry class is a singleton, U.I. elements may call postTurnstileEvent() before the singleton is initialized.
-     * A lambda guards against this possibility
-     */
     private fun postTurnstileEvent() {
-        // AppUserTurnstile is implemented in mapbox-telemetry-sdk
         val sdkId = generateSdkIdentifier()
         dynamicValues.sdkId = sdkId
         val appUserTurnstileEvent =
@@ -403,9 +384,6 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         metricsReporter.addEvent(event)
     }
 
-    /**
-     * This method starts a session. The start of a session does not result in a telemetry event being sent to the servers.
-     */
     private fun sessionStartHelper(directionsRoute: DirectionsRoute) {
         dynamicValues.run {
             originalRoute.set(directionsRoute)
