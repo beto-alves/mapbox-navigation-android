@@ -75,8 +75,18 @@ internal class MapboxDirectionsSession(
     ) {
         router.getRoute(routeOptions, object : Router.Callback {
             override fun onResponse(routes: List<DirectionsRoute>) {
-                this@MapboxDirectionsSession.routes = routes
-                routesRequestCallback?.onRoutesReady(routes)
+                val fixedRoutes = mutableListOf<DirectionsRoute>()
+                for (route in routes) {
+                    val fixedRouteOptions = route.routeOptions()?.toBuilder()
+                            ?.waypointIndices(routeOptions.waypointIndices()!!)
+                            ?.build()
+                    val fixedRoute = route.toBuilder()
+                            .routeOptions(fixedRouteOptions)
+                            .build()
+                    fixedRoutes.add(fixedRoute)
+                }
+                this@MapboxDirectionsSession.routes = fixedRoutes
+                routesRequestCallback?.onRoutesReady(fixedRoutes)
                 // todo log in the future
             }
 

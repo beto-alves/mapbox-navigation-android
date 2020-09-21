@@ -83,29 +83,38 @@ class MapboxRouteOptionsUpdater(
                     }
                 })
                 .waypointIndicesList(let waypointIndicesList@{
-                    if (routeOptions.waypointIndicesList().isNullOrEmpty()) {
+                    val waypointIndicesList = routeOptions.waypointIndicesList()
+                    if (waypointIndicesList.isNullOrEmpty()) {
                         return@waypointIndicesList emptyList<Int>()
                     }
-                    mutableListOf<Int>().also {
-                        it.addAll(
-                            routeOptions.waypointIndicesList()!!.subList(
-                                index,
-                                coordinates.size
-                            )
+                    mutableListOf<Int>().also { updatedWaypointIndicesList ->
+                        var updatedStartWaypointIndicesIndex = 0
+                        routeOptions.waypointIndicesList()!!.forEachIndexed { indx, waypointIndex ->
+                            if (waypointIndex <= index) {
+                                updatedStartWaypointIndicesIndex = indx
+                            }
+                        }
+                        updatedWaypointIndicesList.add(waypointIndicesList[updatedStartWaypointIndicesIndex])
+                        updatedWaypointIndicesList.addAll(
+                                waypointIndicesList.subList(updatedStartWaypointIndicesIndex + 1, waypointIndicesList.size).map { it - index }
                         )
                     }
                 })
                 .waypointNamesList(let waypointNamesList@{
-                    if (routeOptions.waypointNamesList().isNullOrEmpty()) {
+                    val waypointNamesList = routeOptions.waypointNamesList()
+                    if (waypointNamesList.isNullOrEmpty()) {
                         return@waypointNamesList emptyList<String>()
                     }
-                    mutableListOf<String>().also {
-                        it.add("")
-                        it.addAll(
-                            routeOptions.waypointNamesList()!!.subList(
-                                index + 1,
-                                coordinates.size
-                            )
+                    mutableListOf<String>().also { updatedWaypointNamesList ->
+                        var updatedStartWaypointNamesIndex = 0
+                        routeOptions.waypointIndicesList()!!.forEachIndexed { indx, waypointIndex ->
+                            if (waypointIndex <= index) {
+                                updatedStartWaypointNamesIndex = indx
+                            }
+                        }
+                        updatedWaypointNamesList.add(waypointNamesList[updatedStartWaypointNamesIndex])
+                        updatedWaypointNamesList.addAll(
+                                waypointNamesList.subList(updatedStartWaypointNamesIndex + 1, waypointNamesList.size)
                         )
                     }
                 })

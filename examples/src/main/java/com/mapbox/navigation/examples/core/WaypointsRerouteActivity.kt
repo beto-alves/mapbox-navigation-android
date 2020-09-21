@@ -45,7 +45,7 @@ import java.lang.ref.WeakReference
 import kotlinx.android.synthetic.main.activity_reroute_layout.container
 import kotlinx.android.synthetic.main.activity_reroute_layout.mapView
 import kotlinx.android.synthetic.main.activity_reroute_layout.startNavigation
-//import kotlinx.android.synthetic.main.activity_waypoints_reroute_layout.*
+import kotlinx.android.synthetic.main.activity_waypoints_reroute_layout.*
 import timber.log.Timber
 
 /**
@@ -217,6 +217,7 @@ class WaypointsRerouteActivity : AppCompatActivity(), OnMapReadyCallback, OffRou
                                 .accessToken(Utils.getMapboxAccessToken(applicationContext))
 //                        .coordinates(originLocation.toPoint(), null, latLng.toPoint())
                                 .coordinates(stopsController.coordinates(originLocation))
+                                .waypointNames("start;finish")
                                 .waypointIndices("0;${stopsController.stops.size}")
                                 .alternatives(true)
                                 .profile(DirectionsCriteria.PROFILE_DRIVING_TRAFFIC)
@@ -243,12 +244,12 @@ class WaypointsRerouteActivity : AppCompatActivity(), OnMapReadyCallback, OffRou
             }
             mapboxNavigation?.startTripSession()
             startNavigation.visibility = View.GONE
-//            btnReroute.visibility = View.VISIBLE
+            btnReroute.visibility = View.VISIBLE
             stopLocationUpdates()
         }
-//        btnReroute.setOnClickListener {
-//            mapboxNavigation?.reroute()
-//        }
+        btnReroute.setOnClickListener {
+            mapboxNavigation?.reroute()
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -304,7 +305,7 @@ class WaypointsRerouteActivity : AppCompatActivity(), OnMapReadyCallback, OffRou
 
     override fun onOffRouteStateChanged(offRoute: Boolean) {
         if (offRoute) {
-            Toast.makeText(this, "You're off-route", Toast.LENGTH_SHORT).show()
+//            Toast.makeText(this, "You're off-route", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -316,7 +317,7 @@ class WaypointsRerouteActivity : AppCompatActivity(), OnMapReadyCallback, OffRou
             RerouteState.FetchingRoute -> "Reroute request is in progress"
             RerouteState.RouteFetched -> "Reroute request is finished successful"
         }
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+//        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     private class MyLocationEngineCallback(activity: WaypointsRerouteActivity) :

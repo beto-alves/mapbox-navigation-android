@@ -621,7 +621,7 @@ class MapboxNavigation(
         }
     }
 
-    private fun reroute() {
+    public fun reroute() {
         rerouteController?.reroute(object : RerouteController.RoutesCallback {
             override fun onNewRoutes(routes: List<DirectionsRoute>) {
                 setRoutes(routes)
